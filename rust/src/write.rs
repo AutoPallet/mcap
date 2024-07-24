@@ -278,14 +278,7 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
             ));
         }
 
-        self.message_bounds = Some(match self.message_bounds {
-            None => (header.log_time, header.log_time),
-            Some((start, end)) => (start.min(header.log_time), end.max(header.log_time)),
-        });
-        *self
-            .channel_message_counts
-            .entry(header.channel_id)
-            .or_insert(0) += 1;
+        self.update_message_metadata(header);
 
         // if the current chunk is larger than our target chunk size, finish it
         // and start a new one.
@@ -303,6 +296,42 @@ impl<'a, W: Write + Seek> Writer<'a, W> {
 
         self.chunkin_time()?.write_message(header, data)?;
         Ok(())
+    }
+
+    /// Write a message to an added channel, given its ID, without using MCAP chunks.
+    ///
+    /// This method inserts the message into the stream without chunking, which means it's neither
+    /// compressed, nor indexed.
+    ///
+    /// This is not normally what you want to do, but it can be useful on small embedded systems,
+    /// where the memory required to store the chunk metadata until the end of the log is prohibitive.
+    ///
+    /// Note that for performance reasons, this also does not verify the validity of header.channel_id.
+    pub fn write_to_known_channel_unchunked(
+        &mut self,
+        header: &MessageHeader,
+        data: &[u8],
+    ) -> McapResult<()> {
+        self.update_message_metadata(header);
+        write_record(
+            self.finish_chunk()?,
+            &Record::Message {
+                header: *header,
+                data: Cow::Borrowed(data),
+            },
+        )?;
+        Ok(())
+    }
+
+    fn update_message_metadata(&mut self, header: &MessageHeader) {
+        self.message_bounds = Some(match self.message_bounds {
+            None => (header.log_time, header.log_time),
+            Some((start, end)) => (start.min(header.log_time), end.max(header.log_time)),
+        });
+        *self
+            .channel_message_counts
+            .entry(header.channel_id)
+            .or_insert(0) += 1;
     }
 
     pub fn attach(&mut self, attachment: &Attachment) -> McapResult<()> {
