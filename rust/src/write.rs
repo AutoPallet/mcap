@@ -37,7 +37,21 @@ fn op_and_len<W: Write>(w: &mut W, op: u8, len: u64) -> io::Result<()> {
     Ok(())
 }
 
-fn write_record<W: Write>(mut w: &mut W, r: &Record) -> io::Result<()> {
+fn write_message_header<W: Write>(
+    mut w: &mut W,
+    header: &MessageHeader,
+    data_len: usize,
+) -> io::Result<()> {
+    let header_len = header.serialized_len();
+    op_and_len(w, op::MESSAGE, header_len + data_len as u64)?;
+    NoSeek::new(&mut w)
+        .write_le(header)
+        .map_err(io::Error::other)?;
+
+    Ok(())
+}
+
+fn write_record<W: Write>(w: &mut W, r: &Record) -> io::Result<()> {
     // Annoying: our stream isn't Seek if we're writing to a compressed chunk stream,
     // so we need an intermediate buffer.
     macro_rules! record {
@@ -70,11 +84,7 @@ fn write_record<W: Write>(mut w: &mut W, r: &Record) -> io::Result<()> {
         }
         Record::Channel(c) => record!(op::CHANNEL, c),
         Record::Message { header, data } => {
-            let header_len = header.serialized_len();
-            op_and_len(w, op::MESSAGE, header_len + data.len() as u64)?;
-            NoSeek::new(&mut w)
-                .write_le(header)
-                .map_err(io::Error::other)?;
+            write_message_header(w, header, data.len())?;
             w.write_all(data)?;
         }
         Record::Chunk { .. } => {
@@ -604,14 +614,7 @@ impl<W: Write + Seek> Writer<W> {
         self.write_to_known_channel(&header, data)
     }
 
-    /// Write a message to an added channel, given its ID.
-    ///
-    /// This skips hash lookups of the channel and schema if you already added them.
-    pub fn write_to_known_channel(
-        &mut self,
-        header: &MessageHeader,
-        data: &[u8],
-    ) -> McapResult<()> {
+    fn check_known_channel(&mut self, header: &MessageHeader) -> McapResult<()> {
         if !self.channels.contains_right(&header.channel_id) {
             return Err(McapError::UnknownChannel(
                 header.sequence,
@@ -627,6 +630,19 @@ impl<W: Write + Seek> Writer<W> {
             .channel_message_counts
             .entry(header.channel_id)
             .or_insert(0) += 1;
+
+        Ok(())
+    }
+
+    /// Write a message to an added channel, given its ID.
+    ///
+    /// This skips hash lookups of the channel and schema if you already added them.
+    pub fn write_to_known_channel(
+        &mut self,
+        header: &MessageHeader,
+        data: &[u8],
+    ) -> McapResult<()> {
+        self.check_known_channel(header)?;
 
         // if the current chunk is larger than our target chunk size, finish it
         // and start a new one.
@@ -649,6 +665,46 @@ impl<W: Write + Seek> Writer<W> {
                 },
             )?;
         }
+        Ok(())
+    }
+
+    /// Write a message with the data provided in a closure, allowing a direct interface with the
+    /// underlying writer rather than accepting a slice.
+    ///
+    /// Requires the channel to be previously added.
+    ///
+    /// Fails if the number of bytes written by `write_data` does not match `data_len`.
+    pub fn write_to_known_channel_raw<F>(
+        &mut self,
+        header: &MessageHeader,
+        data_len: usize,
+        write_data: F,
+    ) -> McapResult<()>
+    where
+        F: FnOnce(&mut RawWriterWrapper<&mut CountingCrcWriter<W>>) -> McapResult<()>,
+    {
+        self.check_known_channel(header)?;
+
+        if self.options.use_chunks {
+            return Err(McapError::RawWriteUnavailable);
+        }
+
+        let w = self.finish_chunk()?;
+
+        write_message_header(w, header, data_len)?;
+
+        let mut raw_writer = RawWriterWrapper {
+            inner: w,
+            max_len: data_len,
+            total_written: 0,
+        };
+
+        write_data(&mut raw_writer)?;
+
+        if raw_writer.total_written != data_len {
+            return Err(McapError::UnexpectedEoc);
+        }
+
         Ok(())
     }
 
@@ -1519,6 +1575,28 @@ impl<W: Write + Seek> AttachmentWriter<W> {
                 data_size: self.attachment_length,
             },
         ))
+    }
+}
+
+pub struct RawWriterWrapper<W: Write> {
+    inner: W,
+    max_len: usize,
+    total_written: usize,
+}
+
+impl<W: Write> Write for RawWriterWrapper<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if self.total_written + buf.len() > self.max_len {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+
+        let written = self.inner.write(buf)?;
+        self.total_written += written;
+        Ok(written)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
     }
 }
 

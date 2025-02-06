@@ -120,6 +120,8 @@ pub enum McapError {
     Io(#[from] std::io::Error),
     #[error("Schema has an ID of 0")]
     InvalidSchemaId,
+    #[error("write_to_known_channel_raw cannot be used when using chunks")]
+    RawWriteUnavailable,
     #[error("MCAP file ended in the middle of a record")]
     UnexpectedEof,
     #[error("Chunk ended in the middle of a record")]
