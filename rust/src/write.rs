@@ -1083,36 +1083,44 @@ impl<W: Write + Seek> Writer<W> {
         let mut schemas: HashMap<u16, Arc<Schema<'static>>> =
             HashMap::with_capacity(self.all_schema_ids.len());
         let mut channels = HashMap::with_capacity(self.all_channel_ids.len());
-        for (schema_id, canonical_id) in self.all_schema_ids.iter() {
-            let schema_content = self
-                .canonical_schemas
-                .get_by_right(canonical_id)
-                .expect("schema content must be present for canonical id");
+        // Finalization is terminal: transfer owned buffers rather than duplicating the catalog.
+        for (content, id) in take(&mut self.canonical_schemas) {
             schemas.insert(
-                *schema_id,
+                id,
                 Arc::new(Schema {
-                    id: *schema_id,
-                    name: schema_content.name.clone().into(),
-                    encoding: schema_content.encoding.clone().into(),
-                    data: schema_content.data.clone(),
+                    id,
+                    name: content.name.into_owned(),
+                    encoding: content.encoding.into_owned(),
+                    data: content.data,
                 }),
             );
         }
-        for (channel_id, canonical_id) in self.all_channel_ids.iter() {
-            let channel_content = self
-                .canonical_channels
-                .get_by_right(canonical_id)
-                .expect("channel content must be present for canonical id");
+        // write(Message) can assign several IDs to identical content. Preserve those IDs.
+        for (&id, &canonical_id) in &self.all_schema_ids {
+            if id != canonical_id {
+                let mut schema = schemas[&canonical_id].as_ref().clone();
+                schema.id = id;
+                schemas.insert(id, Arc::new(schema));
+            }
+        }
+        for (content, id) in take(&mut self.canonical_channels) {
             channels.insert(
-                *channel_id,
+                id,
                 Arc::new(Channel {
-                    id: *channel_id,
-                    topic: channel_content.topic.clone().into(),
-                    schema: schemas.get(&channel_content.schema_id).cloned(),
-                    message_encoding: channel_content.message_encoding.clone().into(),
-                    metadata: channel_content.metadata.as_ref().to_owned(),
+                    id,
+                    topic: content.topic.into_owned(),
+                    schema: schemas.get(&content.schema_id).cloned(),
+                    message_encoding: content.message_encoding.into_owned(),
+                    metadata: content.metadata.into_owned(),
                 }),
             );
+        }
+        for (&id, &canonical_id) in &self.all_channel_ids {
+            if id != canonical_id {
+                let mut channel = channels[&canonical_id].as_ref().clone();
+                channel.id = id;
+                channels.insert(id, Arc::new(channel));
+            }
         }
         Summary {
             stats: Some(stats),
@@ -1159,6 +1167,7 @@ fn write_summary_and_footer_magic<W: Write + Seek>(
     let all_channels: Vec<_> = summary
         .channels
         .iter()
+        .filter(|_| options.repeat_channels)
         .map(|(&id, channel)| {
             let schema_id = channel.schema.as_ref().map(|schema| schema.id).unwrap_or(0);
             records::Channel {
@@ -1173,13 +1182,14 @@ fn write_summary_and_footer_magic<W: Write + Seek>(
     let all_schemas: Vec<_> = summary
         .schemas
         .iter()
+        .filter(|_| options.repeat_schemas)
         .map(|(&id, schema)| Record::Schema {
             header: records::SchemaHeader {
                 id,
                 name: schema.name.clone(),
                 encoding: schema.encoding.clone(),
             },
-            data: schema.data.clone(),
+            data: Cow::Borrowed(schema.data.as_ref()),
         })
         .collect();
 
@@ -2260,5 +2270,129 @@ mod tests {
             writer.write(&message),
             Err(McapError::AttemptedWriteAfterFailure)
         );
+    }
+}
+#[cfg(test)]
+mod summary_ownership_tests {
+    use super::*;
+
+    #[test]
+    fn summary_moves_owned_schema_and_channel_buffers() {
+        let out = Cursor::new(Vec::new());
+        let mut writer = WriteOptions::default()
+            .use_chunks(false)
+            .emit_summary_records(false)
+            .emit_summary_offsets(false)
+            .create(out)
+            .unwrap();
+        let schema_id = writer
+            .add_schema("reading", "jsonschema", br#"{"type":"integer"}"#)
+            .unwrap();
+        let metadata = BTreeMap::from([("key".to_owned(), "value".to_owned())]);
+        let channel_id = writer
+            .add_channel(schema_id, "topic", "json", &metadata)
+            .unwrap();
+        let schema_ptr = writer
+            .canonical_schemas
+            .get_by_right(&schema_id)
+            .unwrap()
+            .data
+            .as_ptr();
+        let metadata_ptr = writer
+            .canonical_channels
+            .get_by_right(&channel_id)
+            .unwrap()
+            .metadata["key"]
+            .as_ptr();
+        writer
+            .write_to_known_channel(
+                &MessageHeader {
+                    channel_id,
+                    sequence: 1,
+                    log_time: 1,
+                    publish_time: 1,
+                },
+                b"1",
+            )
+            .unwrap();
+        let summary = writer.finish().unwrap();
+        assert_eq!(summary.schemas[&schema_id].data.as_ptr(), schema_ptr);
+        assert_eq!(
+            summary.channels[&channel_id].metadata["key"].as_ptr(),
+            metadata_ptr
+        );
+        assert_eq!(writer.finish().unwrap(), summary);
+        let bytes = writer.into_inner().into_inner();
+        assert!(Summary::read(&bytes).unwrap().is_none());
+        let records: Vec<_> = crate::MessageStream::new(&bytes)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].data.as_ref(), b"1");
+    }
+
+    #[test]
+    fn moved_summary_preserves_schema_and_channel_alias_ids() {
+        for summaries in [false, true] {
+            let out = Cursor::new(Vec::new());
+            let mut writer = WriteOptions::default()
+                .use_chunks(false)
+                .emit_summary_records(summaries)
+                .emit_summary_offsets(summaries)
+                .create(out)
+                .unwrap();
+            let schema = Arc::new(Schema {
+                id: 100,
+                name: "integer".into(),
+                encoding: "jsonschema".into(),
+                data: Cow::Borrowed(br#"{"type":"integer"}"#),
+            });
+            let alias = Arc::new(Schema {
+                id: 2,
+                ..schema.as_ref().clone()
+            });
+            for (id, schema) in [(100, Arc::clone(&schema)), (2, alias), (3, schema)] {
+                writer
+                    .write(&Message {
+                        channel: Arc::new(Channel {
+                            id,
+                            topic: "topic".into(),
+                            message_encoding: "json".into(),
+                            metadata: BTreeMap::new(),
+                            schema: Some(schema),
+                        }),
+                        sequence: id as u32,
+                        log_time: id as u64,
+                        publish_time: id as u64,
+                        data: Cow::Borrowed(b"1"),
+                    })
+                    .unwrap();
+            }
+            let summary = writer.finish().unwrap();
+            assert_eq!(summary.schemas.len(), 2);
+            assert_eq!(summary.channels.len(), 3);
+            assert_eq!(summary.schemas[&2].id, 2);
+            assert_eq!(summary.schemas[&100].id, 100);
+            assert_eq!(summary.schemas[&2].data, summary.schemas[&100].data);
+            assert_eq!(summary.channels[&3].id, 3);
+            assert_eq!(summary.channels[&3].schema.as_ref().unwrap().id, 100);
+            assert_eq!(summary.channels[&2].schema.as_ref().unwrap().id, 2);
+            assert_eq!(writer.finish().unwrap(), summary);
+            let bytes = writer.into_inner().into_inner();
+            if summaries {
+                assert_eq!(Summary::read(&bytes).unwrap().unwrap(), summary);
+            } else {
+                assert!(Summary::read(&bytes).unwrap().is_none());
+            }
+            let records: Vec<_> = crate::MessageStream::new(&bytes)
+                .unwrap()
+                .collect::<Result<_, _>>()
+                .unwrap();
+            assert_eq!(
+                records.iter().map(|m| m.channel.id).collect::<Vec<_>>(),
+                [100, 2, 3]
+            );
+        }
     }
 }
