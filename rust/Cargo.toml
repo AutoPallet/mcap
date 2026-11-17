@@ -40,6 +40,7 @@ lz4 = ["dep:lz4"]
 tokio = [ "dep:tokio"]
 
 [dev-dependencies]
+allocation-counter = "0.8"
 anyhow = "1"
 assert_matches = "1.5.0"
 atty = "0.2"
