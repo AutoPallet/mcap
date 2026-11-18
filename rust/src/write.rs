@@ -1036,8 +1036,6 @@ impl<W: Write + Seek> Writer<W> {
     /// panic.
     pub fn finish(&mut self) -> McapResult<Summary> {
         if let Some(summary) = &self.finished_summary {
-            // We already called finish().
-            // Maybe we're dropping after the user called it?
             return Ok(summary.clone());
         }
         // Finish any chunk we were working on and update stats, indexes, etc.
@@ -1154,7 +1152,9 @@ impl<W: Write + Seek> Writer<W> {
 
 impl<W: Write + Seek> Drop for Writer<W> {
     fn drop(&mut self) {
-        let _ = self.finish();
+        if self.finished_summary.is_none() {
+            let _ = self.finish();
+        }
     }
 }
 
